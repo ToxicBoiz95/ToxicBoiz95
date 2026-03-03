@@ -1,0 +1,476 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0
+// © ToxicBoiz95
+
+//@version=6
+indicator("Market Structure [ToxicBoiz95]", overlay=true,
+          max_lines_count=500, max_labels_count=500)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ▌ INPUTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+pivotLeft    = input.int(3,     "Pivot Length Left",  minval=1, maxval=50, group="Pivot Settings")
+pivotRight   = input.int(3,     "Pivot Length Right", minval=1, maxval=50, group="Pivot Settings")
+showBOSLines = input.bool(true, "Show BOS Lines",     group="Display")
+showImpLvls  = input.bool(true, "Show Imp Levels",    group="Display")
+showLabels   = input.bool(true, "Show Labels",        group="Display")
+showDash     = input.bool(true, "Show Dashboard",     group="Display")
+cleanChart   = input.bool(false,"Clean Chart Mode",   group="Display")
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ▌ COLORS
+// ═══════════════════════════════════════════════════════════════════════════
+
+C_BULL   = color.lime
+C_BEAR   = color.red
+C_IMP_LO = color.new(#00BFFF, 0)   // deep-sky-blue  — Important Low
+C_IMP_HI = color.new(#FF8C00, 0)   // dark-orange    — Important High
+C_SWEEP  = color.yellow
+C_CHARGE = color.fuchsia
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ▌ MODULE 1 — PIVOT DETECTION
+// ═══════════════════════════════════════════════════════════════════════════
+
+ph = ta.pivothigh(high, pivotLeft, pivotRight)
+pl = ta.pivotlow(low,   pivotLeft, pivotRight)
+
+// Most-recently confirmed swing levels (value + bar index of the pivot candle)
+var float swH     = na
+var int   swH_bar = na
+var float swL     = na
+var int   swL_bar = na
+
+// Running min-low  (pivot candle → current bar) used to compute Imp Low on BOS
+// Running max-high (pivot candle → current bar) used to compute Imp High on BOS
+var float runMinLow  = na
+var float runMaxHigh = na
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ▌ STATE VARIABLES
+// ═══════════════════════════════════════════════════════════════════════════
+
+var int   struc   = 0    // 0 = undefined · 1 = bullish · -1 = bearish
+var float impLo   = na   // current Important Low  (bullish structure)
+var float impHi   = na   // current Important High (bearish structure)
+
+// Wick-above / wick-below flags — used to classify BOS as Direct vs Indirect
+var bool  wickH   = false   // wick above swH without a close above
+var bool  wickL   = false   // wick below swL without a close below
+
+// Sweep state
+var bool  swpLoAct = false   // a low sweep is in progress
+var float swpLoExt = na      // lowest wick seen during the current low-sweep run
+var bool  swpHiAct = false   // a high sweep is in progress
+var float swpHiExt = na      // highest wick seen during the current high-sweep run
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ▌ VISUAL OBJECT HANDLES
+// ═══════════════════════════════════════════════════════════════════════════
+
+// BOS lines are historical (one per BOS event) — no single handle needed
+// Trailing underscore suffix marks persistent visual-object handles
+var line  impLoLn_  = na
+var line  impHiLn_  = na
+var label impLoLbl_ = na
+var label impHiLbl_ = na
+var table dashTbl_  = na
+
+// Dashboard — last event info
+var string dEvt     = "None"
+var string dEvtType = "—"
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ▌ PER-BAR EVENT FLAGS  (reset to false on every bar by declaration)
+// ═══════════════════════════════════════════════════════════════════════════
+
+bool eBullBOS_D = false
+bool eBullBOS_I = false
+bool eBearBOS_D = false
+bool eBearBOS_I = false
+bool eLowSwp    = false
+bool eHighSwp   = false
+bool eBullChg_D = false
+bool eBullChg_I = false
+bool eBearChg_D = false
+bool eBearChg_I = false
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ▌ MAIN LOGIC  (candle-close confirmed — no repainting)
+// ═══════════════════════════════════════════════════════════════════════════
+
+if barstate.isconfirmed
+
+    // ── 1. Update pivot references ─────────────────────────────────────────
+
+    bool newH = not na(ph)
+    bool newL = not na(pl)
+
+    if newH
+        swH     := ph
+        swH_bar := bar_index - pivotRight
+        wickH   := false
+        // Seed runMinLow: pivot candle low + every confirmation bar up to current
+        runMinLow := low[pivotRight]
+        for i = 0 to pivotRight - 1
+            if low[i] < runMinLow
+                runMinLow := low[i]
+
+    if newL
+        swL     := pl
+        swL_bar := bar_index - pivotRight
+        wickL   := false
+        // Seed runMaxHigh: pivot candle high + every confirmation bar up to current
+        runMaxHigh := high[pivotRight]
+        for i = 0 to pivotRight - 1
+            if high[i] > runMaxHigh
+                runMaxHigh := high[i]
+
+    // ── 2. Extend running extremes on non-pivot bars ───────────────────────
+
+    if not newH and not na(swH)
+        if na(runMinLow) or low < runMinLow
+            runMinLow := low
+
+    if not newL and not na(swL)
+        if na(runMaxHigh) or high > runMaxHigh
+            runMaxHigh := high
+
+    // ── 3. BOS detection ──────────────────────────────────────────────────
+    // (Bullish BOS = close above swing-high / Bearish BOS = close below swing-low)
+
+    if not na(swH) and close > swH
+        if wickH
+            eBullBOS_I := true
+        else
+            eBullBOS_D := true
+
+    if not na(swL) and close < swL
+        if wickL
+            eBearBOS_I := true
+        else
+            eBearBOS_D := true
+
+    // ── 4. Wick tracking for future Indirect-BOS classification ───────────
+    // Only update when no BOS was confirmed this bar
+
+    if not (eBullBOS_D or eBullBOS_I)
+        if not na(swH) and high > swH and close <= swH
+            wickH := true
+
+    if not (eBearBOS_D or eBearBOS_I)
+        if not na(swL) and low < swL and close >= swL
+            wickL := true
+
+    // ── 5. Process BOS: update structure, Imp level, reset state ──────────
+    // Save swing references now (they are cleared below for visual use later)
+
+    float vSwH   = swH
+    int   vSwHb  = swH_bar
+    float vSwL   = swL
+    int   vSwLb  = swL_bar
+
+    if eBullBOS_D or eBullBOS_I
+        // Include BOS candle's own low in the window minimum
+        if na(runMinLow) or low < runMinLow
+            runMinLow := low
+        impLo      := runMinLow
+        struc      := 1
+        // Reset swing-high tracking — wait for the next pivot
+        swH        := na
+        swH_bar    := na
+        wickH      := false
+        runMinLow  := na
+        // Reset any in-progress low sweep (new BOS, fresh slate)
+        swpLoAct   := false
+        swpLoExt   := na
+        dEvt       := "BOS"
+        dEvtType   := eBullBOS_D ? "Direct" : "Indirect"
+
+    if eBearBOS_D or eBearBOS_I
+        // Include BOS candle's own high in the window maximum
+        if na(runMaxHigh) or high > runMaxHigh
+            runMaxHigh := high
+        impHi      := runMaxHigh
+        struc      := -1
+        // Reset swing-low tracking — wait for the next pivot
+        swL        := na
+        swL_bar    := na
+        wickL      := false
+        runMaxHigh := na
+        // Reset any in-progress high sweep
+        swpHiAct   := false
+        swpHiExt   := na
+        dEvt       := "BOS"
+        dEvtType   := eBearBOS_D ? "Direct" : "Indirect"
+
+    // ── 6. Sweep & Charge detection (skipped on BOS bar) ──────────────────
+
+    bool bosThisBar = eBullBOS_D or eBullBOS_I or eBearBOS_D or eBearBOS_I
+
+    if not bosThisBar
+
+        // ·· Bullish structure — monitor Important Low ·····················
+        if struc == 1 and not na(impLo)
+            if swpLoAct
+                // A low-sweep is already active
+                if close < swpLoExt
+                    // Close below the sweep extreme → Indirect Bearish Charge
+                    eBearChg_I := true
+                else if low < impLo and close >= impLo
+                    // Another wick below — update extreme, fire Sweep event
+                    if na(swpLoExt) or low < swpLoExt
+                        swpLoExt := low
+                    eLowSwp := true
+            else
+                // No sweep active yet
+                if close < impLo
+                    // Close directly below Imp Low → Direct Bearish Charge
+                    eBearChg_D := true
+                else if low < impLo and close >= impLo
+                    // Wick below, close above → Low Sweep initiated
+                    eLowSwp  := true
+                    swpLoAct := true
+                    swpLoExt := low
+
+        // ·· Bearish structure — monitor Important High ····················
+        if struc == -1 and not na(impHi)
+            if swpHiAct
+                // A high-sweep is already active
+                if close > swpHiExt
+                    // Close above the sweep extreme → Indirect Bullish Charge
+                    eBullChg_I := true
+                else if high > impHi and close <= impHi
+                    // Another wick above — update extreme, fire Sweep event
+                    if na(swpHiExt) or high > swpHiExt
+                        swpHiExt := high
+                    eHighSwp := true
+            else
+                // No sweep active yet
+                if close > impHi
+                    // Close directly above Imp High → Direct Bullish Charge
+                    eBullChg_D := true
+                else if high > impHi and close <= impHi
+                    // Wick above, close below → High Sweep initiated
+                    eHighSwp := true
+                    swpHiAct := true
+                    swpHiExt := high
+
+    // ── 7. Process Charge: flip structure, clear Imp level ────────────────
+
+    if eBearChg_D or eBearChg_I
+        struc    := -1
+        impLo    := na
+        swpLoAct := false
+        swpLoExt := na
+        dEvt     := "Charge"
+        dEvtType := eBearChg_D ? "Direct" : "Indirect"
+
+    if eBullChg_D or eBullChg_I
+        struc    := 1
+        impHi    := na
+        swpHiAct := false
+        swpHiExt := na
+        dEvt     := "Charge"
+        dEvtType := eBullChg_D ? "Direct" : "Indirect"
+
+    // Sweep event label priority is lower than BOS / Charge
+    if (eLowSwp or eHighSwp) and not (eBearChg_D or eBearChg_I or eBullChg_D or eBullChg_I)
+        dEvt     := "Sweep"
+        dEvtType := eLowSwp ? "Low" : "High"
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // ▌ VISUAL OUTPUT
+    // ═══════════════════════════════════════════════════════════════════════
+
+    bool doShowBOS = showBOSLines and not cleanChart
+    bool doShowImp = showImpLvls
+    bool doShowLbl = showLabels and not cleanChart
+
+    // ── BOS Lines ──────────────────────────────────────────────────────────
+    // One fixed horizontal line per BOS event (historical, never deleted)
+
+    if doShowBOS
+        if eBullBOS_D or eBullBOS_I
+            line.new(
+                 x1=vSwHb, y1=vSwH,
+                 x2=bar_index, y2=vSwH,
+                 color=C_BULL, width=2, xloc=xloc.bar_index)
+
+        if eBearBOS_D or eBearBOS_I
+            line.new(
+                 x1=vSwLb, y1=vSwL,
+                 x2=bar_index, y2=vSwL,
+                 color=C_BEAR, width=2, xloc=xloc.bar_index)
+
+    // ── Event Labels ───────────────────────────────────────────────────────
+
+    if doShowLbl
+        string lbl_txt = ""
+        float  lbl_y   = na
+        color  lbl_col = color.white
+        string lbl_sty = label.style_label_down
+
+        if eBullBOS_D
+            lbl_txt := "BOS (Direct)"
+            lbl_y   := high
+            lbl_col := C_BULL
+            lbl_sty := label.style_label_down
+        else if eBullBOS_I
+            lbl_txt := "BOS (Indirect)"
+            lbl_y   := high
+            lbl_col := C_BULL
+            lbl_sty := label.style_label_down
+        else if eBearBOS_D
+            lbl_txt := "BOS (Direct)"
+            lbl_y   := low
+            lbl_col := C_BEAR
+            lbl_sty := label.style_label_up
+        else if eBearBOS_I
+            lbl_txt := "BOS (Indirect)"
+            lbl_y   := low
+            lbl_col := C_BEAR
+            lbl_sty := label.style_label_up
+        else if eBearChg_D
+            lbl_txt := "Charge (Direct)"
+            lbl_y   := low
+            lbl_col := C_CHARGE
+            lbl_sty := label.style_label_up
+        else if eBearChg_I
+            lbl_txt := "Charge (Indirect)"
+            lbl_y   := low
+            lbl_col := C_CHARGE
+            lbl_sty := label.style_label_up
+        else if eBullChg_D
+            lbl_txt := "Charge (Direct)"
+            lbl_y   := high
+            lbl_col := C_CHARGE
+            lbl_sty := label.style_label_down
+        else if eBullChg_I
+            lbl_txt := "Charge (Indirect)"
+            lbl_y   := high
+            lbl_col := C_CHARGE
+            lbl_sty := label.style_label_down
+        else if eLowSwp
+            lbl_txt := "Sweep"
+            lbl_y   := low
+            lbl_col := C_SWEEP
+            lbl_sty := label.style_label_up
+        else if eHighSwp
+            lbl_txt := "Sweep"
+            lbl_y   := high
+            lbl_col := C_SWEEP
+            lbl_sty := label.style_label_down
+
+        if lbl_txt != ""
+            label.new(bar_index, lbl_y, lbl_txt,
+                      color=lbl_col, textcolor=color.white,
+                      style=lbl_sty, size=size.small)
+
+    // ── Important Level Lines & Labels ─────────────────────────────────────
+
+    if doShowImp
+        // Redraw Imp Low whenever a Bullish BOS fires
+        if eBullBOS_D or eBullBOS_I
+            if not na(impLoLn_)
+                line.delete(impLoLn_)
+            if not na(impLoLbl_)
+                label.delete(impLoLbl_)
+            if not na(impLo)
+                impLoLn_  := line.new(
+                     x1=bar_index, y1=impLo,
+                     x2=bar_index + 30, y2=impLo,
+                     color=C_IMP_LO, width=1,
+                     style=line.style_dashed, xloc=xloc.bar_index)
+                impLoLbl_ := label.new(
+                     bar_index + 30, impLo, "Imp Low",
+                     color=C_IMP_LO, textcolor=color.white,
+                     style=label.style_label_left, size=size.small,
+                     xloc=xloc.bar_index)
+
+        // Redraw Imp High whenever a Bearish BOS fires
+        if eBearBOS_D or eBearBOS_I
+            if not na(impHiLn_)
+                line.delete(impHiLn_)
+            if not na(impHiLbl_)
+                label.delete(impHiLbl_)
+            if not na(impHi)
+                impHiLn_  := line.new(
+                     x1=bar_index, y1=impHi,
+                     x2=bar_index + 30, y2=impHi,
+                     color=C_IMP_HI, width=1,
+                     style=line.style_dashed, xloc=xloc.bar_index)
+                impHiLbl_ := label.new(
+                     bar_index + 30, impHi, "Imp High",
+                     color=C_IMP_HI, textcolor=color.white,
+                     style=label.style_label_left, size=size.small,
+                     xloc=xloc.bar_index)
+
+        // Remove Imp Low on Bearish Charge (structure flipped to bearish)
+        if eBearChg_D or eBearChg_I
+            if not na(impLoLn_)
+                line.delete(impLoLn_)
+                impLoLn_ := na
+            if not na(impLoLbl_)
+                label.delete(impLoLbl_)
+                impLoLbl_ := na
+
+        // Remove Imp High on Bullish Charge (structure flipped to bullish)
+        if eBullChg_D or eBullChg_I
+            if not na(impHiLn_)
+                line.delete(impHiLn_)
+                impHiLn_ := na
+            if not na(impHiLbl_)
+                label.delete(impHiLbl_)
+                impHiLbl_ := na
+
+    // ── Dashboard Table ────────────────────────────────────────────────────
+
+    if showDash
+        if na(dashTbl_)
+            dashTbl_ := table.new(
+                 position.top_right, 2, 5,
+                 bgcolor=color.new(color.black, 70),
+                 border_color=color.new(color.white, 60),
+                 border_width=1, frame_color=color.new(color.white, 40),
+                 frame_width=1)
+
+        string structureLabel = struc == 1 ? "BULLISH" : struc == -1 ? "BEARISH" : "UNDEFINED"
+        color  structureColor = struc == 1 ? C_BULL    : struc == -1 ? C_BEAR    : color.gray
+
+        color BG = color.new(color.black, 70)
+        color HG = color.new(color.gray, 80)
+
+        table.cell(dashTbl_, 0, 0, "Structure",  text_color=color.silver, bgcolor=HG, text_halign=text.align_left)
+        table.cell(dashTbl_, 1, 0, structureLabel,     text_color=structureColor,     bgcolor=BG)
+
+        table.cell(dashTbl_, 0, 1, "Imp Low",    text_color=color.silver, bgcolor=HG, text_halign=text.align_left)
+        table.cell(dashTbl_, 1, 1,
+             na(impLo) ? "—" : str.tostring(impLo, format.mintick),
+             text_color=C_IMP_LO, bgcolor=BG)
+
+        table.cell(dashTbl_, 0, 2, "Imp High",   text_color=color.silver, bgcolor=HG, text_halign=text.align_left)
+        table.cell(dashTbl_, 1, 2,
+             na(impHi) ? "—" : str.tostring(impHi, format.mintick),
+             text_color=C_IMP_HI, bgcolor=BG)
+
+        table.cell(dashTbl_, 0, 3, "Last Event", text_color=color.silver, bgcolor=HG, text_halign=text.align_left)
+        table.cell(dashTbl_, 1, 3, dEvt,         text_color=color.white,  bgcolor=BG)
+
+        table.cell(dashTbl_, 0, 4, "Event Type", text_color=color.silver, bgcolor=HG, text_halign=text.align_left)
+        table.cell(dashTbl_, 1, 4, dEvtType,     text_color=color.white,  bgcolor=BG)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ▌ ALERTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+alertcondition(eBullBOS_D, "Bullish BOS (Direct)",      "Bullish BOS (Direct) confirmed")
+alertcondition(eBullBOS_I, "Bullish BOS (Indirect)",    "Bullish BOS (Indirect) confirmed")
+alertcondition(eBearBOS_D, "Bearish BOS (Direct)",      "Bearish BOS (Direct) confirmed")
+alertcondition(eBearBOS_I, "Bearish BOS (Indirect)",    "Bearish BOS (Indirect) confirmed")
+alertcondition(eLowSwp,    "Low Sweep",                 "Low Sweep detected")
+alertcondition(eHighSwp,   "High Sweep",                "High Sweep detected")
+alertcondition(eBearChg_D, "Bearish Charge (Direct)",   "Bearish Charge (Direct) — structure flipped to Bearish")
+alertcondition(eBearChg_I, "Bearish Charge (Indirect)", "Bearish Charge (Indirect) — structure flipped to Bearish")
+alertcondition(eBullChg_D, "Bullish Charge (Direct)",   "Bullish Charge (Direct) — structure flipped to Bullish")
+alertcondition(eBullChg_I, "Bullish Charge (Indirect)", "Bullish Charge (Indirect) — structure flipped to Bullish")
