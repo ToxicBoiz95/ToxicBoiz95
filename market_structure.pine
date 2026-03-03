@@ -309,7 +309,7 @@ if barstate.isconfirmed
         string lbl_txt = ""
         float  lbl_y   = na
         color  lbl_col = color.white
-        label.style lbl_sty = label.style_label_down
+        lbl_sty = label.style_label_down
 
         if eBullBOS_D
             lbl_txt := "BOS (Direct)"
